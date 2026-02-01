@@ -30,9 +30,20 @@ interface FreshRSSResponse {
   last_refreshed_on_time: number;
   total_items?: number;
   items?: FreshRSSItem[];
+  unread_item_ids?: string;
+  saved_item_ids?: string;
   feeds?: any[];
   feeds_groups?: any[];
   groups?: any[];
+}
+
+function chunkArray<T>(arr: T[], chunkSize: number): T[][] {
+  if (chunkSize <= 0) return [arr];
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += chunkSize) {
+    out.push(arr.slice(i, i + chunkSize));
+  }
+  return out;
 }
 
 // FreshRSS API client class
@@ -96,22 +107,45 @@ class FreshRSSClient {
 
   // Get unread items
   async getUnreadItems(): Promise<FreshRSSResponse> {
-    // Get all items and filter them on our side
-    const response = await this.request<FreshRSSResponse>('', 'GET', {
-      items: ''
+    /**
+     * IMPORTANT:
+     * Calling the Fever API with only `items` returns a limited window (often 50 items).
+     * That can miss unread items from other feeds (e.g. YouTube).
+     *
+     * The correct way is:
+     * 1) fetch `unread_item_ids`
+     * 2) fetch those entries via `items` + `with_ids`
+     */
+    const unreadIdsResp = await this.request<FreshRSSResponse>('', 'GET', {
+      unread_item_ids: '',
     });
 
-    // Filter to only include unread items
-    if (response.items && Array.isArray(response.items)) {
-      response.items = response.items.filter(item => item.is_read === 0);
+    const unreadIds = String(unreadIdsResp.unread_item_ids || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
 
-      // Update total_items count
-      if (response.total_items !== undefined) {
-        response.total_items = response.items.length;
+    const allUnreadItems: FreshRSSItem[] = [];
+    for (const batch of chunkArray(unreadIds, 50)) {
+      const itemsResp = await this.request<FreshRSSResponse>('', 'GET', {
+        items: '',
+        with_ids: batch.join(','),
+      });
+      if (itemsResp.items && Array.isArray(itemsResp.items)) {
+        allUnreadItems.push(...itemsResp.items);
       }
     }
 
-    return response;
+    // Ensure we only return unread items (defensive)
+    const items = allUnreadItems.filter((item) => item.is_read === 0);
+
+    return {
+      api_version: unreadIdsResp.api_version,
+      auth: unreadIdsResp.auth,
+      last_refreshed_on_time: unreadIdsResp.last_refreshed_on_time,
+      total_items: items.length,
+      items,
+    };
   }
 
   // Get feed items
@@ -121,7 +155,8 @@ class FreshRSSClient {
 
     return this.request<FreshRSSResponse>('', 'GET', {
       items: '',
-      feed_id: numericFeedId
+      // Fever API uses `feed_ids` (plural) to filter by feed
+      feed_ids: String(numericFeedId),
     });
   }
 
@@ -329,7 +364,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Filter items to only include those from the requested feed
         if (response.items && Array.isArray(response.items)) {
           const numericFeedId = parseInt(feed_id, 10);
-          response.items = response.items.filter((item: FreshRSSItem) => item.feed_id === numericFeedId);
+          response.items = response.items.filter(
+            (item: FreshRSSItem) => String(item.feed_id) === String(numericFeedId)
+          );
 
           // Update total_items count to reflect the filtered items
           if (response.total_items !== undefined) {
