@@ -195,6 +195,74 @@ class FreshRSSClient {
       with_ids: itemIds.join(',')
     });
   }
+
+  /**
+   * Unsubscribe from a feed (remove subscription).
+   * Uses the Google Reader compatible API; Fever API does not support this.
+   */
+  async unsubscribeFeed(feedId: string | number): Promise<void> {
+    const base = this.apiUrl.replace(/\/$/, '') + '/api/greader.php';
+    const fid = String(feedId);
+
+    // 1) ClientLogin to get Auth token
+    const loginRes = await axios({
+      method: 'POST',
+      url: `${base}/accounts/ClientLogin`,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      data: new URLSearchParams({
+        Email: this.username,
+        Passwd: this.password,
+      }),
+    }).catch((err) => {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `FreshRSS Google Reader login failed: ${axios.isAxiosError(err) ? err.response?.data || err.message : err}`
+      );
+    });
+
+    const authMatch = String(loginRes.data).match(/Auth=([^\s\n]+)/);
+    if (!authMatch) {
+      throw new McpError(ErrorCode.InternalError, 'FreshRSS Google Reader: no Auth token in login response');
+    }
+    const auth = authMatch[1].trim();
+
+    // 2) Get write token
+    const tokenRes = await axios({
+      method: 'GET',
+      url: `${base}/reader/api/0/token`,
+      headers: { Authorization: `GoogleLogin auth=${auth}` },
+    }).catch((err) => {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `FreshRSS Google Reader token failed: ${axios.isAxiosError(err) ? err.response?.data || err.message : err}`
+      );
+    });
+
+    const editToken = String(tokenRes.data?.trim() ?? '').replace(/\s/g, '');
+    if (!editToken) {
+      throw new McpError(ErrorCode.InternalError, 'FreshRSS Google Reader: no edit token returned');
+    }
+
+    // 3) Unsubscribe: s=feed/<id> (stream id); ac=unsubscribe; T=token
+    await axios({
+      method: 'POST',
+      url: `${base}/reader/api/0/subscription/edit`,
+      headers: {
+        Authorization: `GoogleLogin auth=${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      data: new URLSearchParams({
+        ac: 'unsubscribe',
+        s: `feed/${fid}`,
+        T: editToken,
+      }),
+    }).catch((err) => {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `FreshRSS unsubscribe failed: ${axios.isAxiosError(err) ? err.response?.data || err.message : err}`
+      );
+    });
+  }
 }
 
 // Initialize server
@@ -320,6 +388,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["item_ids"],
       },
     },
+    {
+      name: "unsubscribe_feed",
+      description: "Unsubscribe from a feed (remove the feed subscription). Uses Google Reader API.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          feed_id: {
+            type: "string",
+            description: "Feed ID to unsubscribe from (same ID as in list_feeds)",
+          },
+        },
+        required: ["feed_id"],
+      },
+    },
   ],
 }));
 
@@ -422,6 +504,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [{
             type: "text",
             text: JSON.stringify(items, null, 2),
+          }],
+        };
+      }
+
+      case "unsubscribe_feed": {
+        const { feed_id } = request.params.arguments as { feed_id: string };
+        await client.unsubscribeFeed(feed_id);
+        return {
+          content: [{
+            type: "text",
+            text: `Successfully unsubscribed from feed ${feed_id}`,
           }],
         };
       }
