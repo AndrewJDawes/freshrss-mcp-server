@@ -197,14 +197,11 @@ class FreshRSSClient {
   }
 
   /**
-   * Unsubscribe from a feed (remove subscription).
-   * Uses the Google Reader compatible API; Fever API does not support this.
+   * Get Google Reader API auth and write token. Used for subscribe, unsubscribe, and category operations.
    */
-  async unsubscribeFeed(feedId: string | number): Promise<void> {
+  private async getGReaderAuthAndToken(): Promise<{ auth: string; editToken: string; base: string }> {
     const base = this.apiUrl.replace(/\/$/, '') + '/api/greader.php';
-    const fid = String(feedId);
 
-    // 1) ClientLogin to get Auth token
     const loginRes = await axios({
       method: 'POST',
       url: `${base}/accounts/ClientLogin`,
@@ -226,7 +223,6 @@ class FreshRSSClient {
     }
     const auth = authMatch[1].trim();
 
-    // 2) Get write token
     const tokenRes = await axios({
       method: 'GET',
       url: `${base}/reader/api/0/token`,
@@ -243,7 +239,113 @@ class FreshRSSClient {
       throw new McpError(ErrorCode.InternalError, 'FreshRSS Google Reader: no edit token returned');
     }
 
-    // 3) Unsubscribe: s=feed/<id> (stream id); ac=unsubscribe; T=token
+    return { auth, editToken, base };
+  }
+
+  /**
+   * Subscribe to a feed by URL. Optionally place it in a category (folder); the category is created if it doesn't exist.
+   * Uses the Google Reader compatible API.
+   */
+  async subscribeFeed(feedUrl: string, categoryName?: string): Promise<{ feedId?: string; title?: string; numResults?: number; error?: string }> {
+    const { auth, editToken, base } = await this.getGReaderAuthAndToken();
+
+    const params: Record<string, string> = {
+      ac: 'subscribe',
+      s: `feed/${feedUrl}`,
+      T: editToken,
+    };
+    if (categoryName != null && categoryName !== '') {
+      // Google Reader label for folder/category (name as-is; form encoding handles spaces/special chars)
+      params['a'] = `user/-/label/${categoryName}`;
+    }
+
+    const res = await axios({
+      method: 'POST',
+      url: `${base}/reader/api/0/subscription/edit`,
+      headers: {
+        Authorization: `GoogleLogin auth=${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      data: new URLSearchParams(params),
+      validateStatus: () => true,
+    });
+
+    const body = res.data;
+    if (res.status !== 200) {
+      const msg = typeof body === 'string' ? body : (body?.error || body?.message || JSON.stringify(body));
+      return { error: msg };
+    }
+    // subscription/edit returns plain "OK" on success; quickadd returns JSON
+    if (typeof body === 'string' && body.trim() === 'OK') {
+      return { feedId: undefined, title: undefined, numResults: 1 };
+    }
+    return {
+      feedId: body?.streamId ?? body?.feedId,
+      title: body?.streamName ?? body?.title,
+      numResults: body?.numResults,
+      error: body?.error,
+    };
+  }
+
+  /**
+   * Ensure a category (folder) exists. If it doesn't exist yet, creates it by subscribing a known feed to it.
+   * Uses the Google Reader compatible API.
+   */
+  async createCategory(categoryName: string): Promise<{ created: boolean; message: string }> {
+    const { auth, editToken, base } = await this.getGReaderAuthAndToken();
+
+    const listRes = await axios({
+      method: 'GET',
+      url: `${base}/reader/api/0/tag/list`,
+      headers: { Authorization: `GoogleLogin auth=${auth}` },
+      params: { output: 'json' },
+    }).catch((err) => {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `FreshRSS tag list failed: ${axios.isAxiosError(err) ? err.response?.data || err.message : err}`
+      );
+    });
+
+    const tags: Array<{ id?: string; type?: string }> = listRes.data?.tags ?? [];
+    const labelId = `user/-/label/${categoryName}`;
+    const exists = tags.some((t: { id?: string }) => t.id === labelId);
+    if (exists) {
+      return { created: false, message: `Category "${categoryName}" already exists.` };
+    }
+
+    // Create category by subscribing a feed to it (FreshRSS creates the folder)
+    const placeholderFeed = 'https://github.com/FreshRSS/FreshRSS/releases.atom';
+    await axios({
+      method: 'POST',
+      url: `${base}/reader/api/0/subscription/edit`,
+      headers: {
+        Authorization: `GoogleLogin auth=${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      data: new URLSearchParams({
+        ac: 'subscribe',
+        s: `feed/${placeholderFeed}`,
+        a: labelId,
+        T: editToken,
+      }),
+    }).catch((err) => {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `FreshRSS create category failed: ${axios.isAxiosError(err) ? err.response?.data || err.message : err}`
+      );
+    });
+
+    return { created: true, message: `Category "${categoryName}" created.` };
+  }
+
+  /**
+   * Unsubscribe from a feed (remove subscription).
+   * Uses the Google Reader compatible API; Fever API does not support this.
+   */
+  async unsubscribeFeed(feedId: string | number): Promise<void> {
+    const { auth, editToken, base } = await this.getGReaderAuthAndToken();
+    const fid = String(feedId);
+
     await axios({
       method: 'POST',
       url: `${base}/reader/api/0/subscription/edit`,
@@ -402,6 +504,38 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["feed_id"],
       },
     },
+    {
+      name: "create_category",
+      description: "Create a category (folder) in FreshRSS if it does not exist. Uses Google Reader API.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          category_name: {
+            type: "string",
+            description: "Name of the category/folder to create (e.g. 'AI')",
+          },
+        },
+        required: ["category_name"],
+      },
+    },
+    {
+      name: "subscribe_feed",
+      description: "Subscribe to a feed by URL. Optionally place it in a category (folder); the category is created if it doesn't exist. Uses Google Reader API.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          feed_url: {
+            type: "string",
+            description: "Feed URL or site URL (e.g. https://example.com/feed.xml)",
+          },
+          category_name: {
+            type: "string",
+            description: "Optional category/folder name to put the feed in",
+          },
+        },
+        required: ["feed_url"],
+      },
+    },
   ],
 }));
 
@@ -515,6 +649,37 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [{
             type: "text",
             text: `Successfully unsubscribed from feed ${feed_id}`,
+          }],
+        };
+      }
+
+      case "create_category": {
+        const { category_name } = request.params.arguments as { category_name: string };
+        const catResult = await client.createCategory(category_name);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(catResult, null, 2),
+          }],
+        };
+      }
+
+      case "subscribe_feed": {
+        const args = request.params.arguments as { feed_url: string; category_name?: string };
+        const { feed_url, category_name } = args;
+        const subResult = await client.subscribeFeed(feed_url, category_name);
+        if (subResult.error) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({ success: false, error: subResult.error }, null, 2),
+            }],
+          };
+        }
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({ success: true, ...subResult }, null, 2),
           }],
         };
       }
